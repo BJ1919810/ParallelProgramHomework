@@ -1,0 +1,11 @@
+{
+    "name": "C++ Development Environment",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "workspaceFolder": "/workspace",
+    "extensions": [
+        "ms-vscode.cpptools",  // C++ 扩展
+        "ms-vscode.cmake-tools"  // CMake 扩展（如果需要）
+    ]
+}
