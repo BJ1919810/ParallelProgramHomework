@@ -4,8 +4,11 @@
 #include <cstring>
 #include <dirent.h>
 #include <climits>
+#include <cmath>
 
 #define MAX_KEYLEN 64
+#define INIT_HASH_CAP 100003   // 初始哈希表容量
+#define MAX_LOAD_FACTOR 0.75   // 哈希表最大负载因子
 
 struct Entry {
     char key[MAX_KEYLEN + 1];
@@ -20,6 +23,7 @@ struct Node {
 
 struct HashMap {
     size_t cap;
+    size_t size;     // 当前元素数量
     Node** buckets;
 };
 
@@ -35,6 +39,7 @@ HashMap* createHashMap(size_t cap) {
     HashMap* m = (HashMap*)malloc(sizeof(HashMap));
     if (!m) return NULL;
     m->cap = cap;
+    m->size = 0;
     m->buckets = (Node**)calloc(cap, sizeof(Node*));
     if (!m->buckets) {
         free(m);
@@ -43,7 +48,34 @@ HashMap* createHashMap(size_t cap) {
     return m;
 }
 
+void mapExpand(HashMap* m, int key_len) {
+    size_t new_cap = m->cap * 2;
+    Node** new_buckets = (Node**)calloc(new_cap, sizeof(Node*));
+    if (!new_buckets) return;
+    
+    // 重哈希所有节点
+    for (size_t i = 0; i < m->cap; i++) {
+        Node* cur = m->buckets[i];
+        while (cur) {
+            Node* next = cur->next;
+            unsigned long h = hash_str(cur->key, key_len) % new_cap;
+            cur->next = new_buckets[h];
+            new_buckets[h] = cur;
+            cur = next;
+        }
+    }
+    
+    free(m->buckets);
+    m->buckets = new_buckets;
+    m->cap = new_cap;
+}
+
 void mapAdd(HashMap* m, const char* key, int cnt, int key_len) {
+    // 检查是否需要扩展哈希表
+    if (m->size >= m->cap * MAX_LOAD_FACTOR) {
+        mapExpand(m, key_len);
+    }
+    
     unsigned long h = hash_str(key, key_len) % m->cap;
     Node* cur = m->buckets[h];
     while (cur) {
@@ -53,6 +85,8 @@ void mapAdd(HashMap* m, const char* key, int cnt, int key_len) {
         }
         cur = cur->next;
     }
+    
+    // 创建新节点
     Node* n = (Node*)malloc(sizeof(Node));
     if (!n) return;
     memcpy(n->key, key, key_len);
@@ -60,6 +94,7 @@ void mapAdd(HashMap* m, const char* key, int cnt, int key_len) {
     n->count = cnt;
     n->next = m->buckets[h];
     m->buckets[h] = n;
+    m->size++;
 }
 
 void freeHashMap(HashMap* m) {
@@ -67,9 +102,9 @@ void freeHashMap(HashMap* m) {
     for (size_t i = 0; i < m->cap; i++) {
         Node* cur = m->buckets[i];
         while (cur) {
-            Node* nxt = cur->next;
+            Node* next = cur->next;
             free(cur);
-            cur = nxt;
+            cur = next;
         }
     }
     free(m->buckets);
@@ -85,6 +120,12 @@ void swapEntry(Entry &a, Entry &b) {
 int cmpEntry(const Entry &a, const Entry &b) {
     if (a.count != b.count) return (b.count - a.count);
     return strcmp(a.key, b.key);
+}
+
+int cmpKey(const void* a, const void* b) {
+    const Entry* ea = (const Entry*)a;
+    const Entry* eb = (const Entry*)b;
+    return strcmp(ea->key, eb->key);
 }
 
 void quickSortForEntry(Entry *arr, int left, int right) {
@@ -141,7 +182,7 @@ int main(int argc, char *argv[]) {
         MPI_Barrier(MPI_COMM_WORLD);
         double t0 = MPI_Wtime();
 
-        // 打开文件并统计每个进程应读区间
+        // 打开文件
         MPI_File fh;
         int rc = MPI_File_open(MPI_COMM_WORLD, filepath, MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
         if (rc != MPI_SUCCESS) {
@@ -154,127 +195,138 @@ int main(int argc, char *argv[]) {
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         
+        // 获取文件大小
         MPI_Offset file_size;
         MPI_File_get_size(fh, &file_size);
         MPI_Offset chunk = file_size / nprocs;
         MPI_Offset my_off = rank * chunk;
         MPI_Offset my_end = (rank == nprocs - 1) ? file_size : (my_off + chunk);
 
-        // 边界处理：确保从行首开始读取
-        if (rank > 0) {
-            if (my_off > 0) {
-                char c;
-                MPI_File_seek(fh, my_off - 1, MPI_SEEK_SET);
-                MPI_File_read(fh, &c, 1, MPI_CHAR, MPI_STATUS_IGNORE);
-                if (c != '\n') {
-                    // 跳过不完整的行
-                    while (my_off < file_size) {
-                        MPI_File_read(fh, &c, 1, MPI_CHAR, MPI_STATUS_IGNORE);
-                        my_off++;
-                        if (c == '\n') break;
-                    }
-                } else {
-                    my_off--; // 回退到换行符后
-                }
+        // 边界处理：确保从行首开始
+        if (rank > 0 && my_off > 0) {
+            const size_t probe_size = 4096;  // 4KB探测块
+            char* probe_buf = (char*)malloc(probe_size);
+            if (!probe_buf) {
+                fprintf(stderr, "[%d] malloc failed\n", rank);
+                MPI_Abort(MPI_COMM_WORLD, 1);
             }
+            
+            // 读取探测块查找换行符
+            MPI_File_read_at(fh, my_off, probe_buf, probe_size, MPI_CHAR, MPI_STATUS_IGNORE);
+            char* nl_pos = (char*)memchr(probe_buf, '\n', probe_size);
+            
+            if (nl_pos) {
+                my_off += (nl_pos - probe_buf) + 1;  // 移动到行首
+            }
+            
+            free(probe_buf);
         }
 
-        // 创建动态缓冲区
-        int buf_size = (key_len + 2) * 1024; // 每个行缓冲区大小
+        // 创建大缓冲区（16MB）
+        size_t buf_size = 16 * 1024 * 1024;
         char *buf = (char*)malloc(buf_size);
         if (!buf) {
             fprintf(stderr, "[%d] malloc failed\n", rank);
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
-        // 修复1: 使用MPI_File_read而不是fdopen
-        HashMap *map = createHashMap(100003);
+        // 创建哈希表
+        HashMap *map = createHashMap(INIT_HASH_CAP);
+        if (!map) {
+            fprintf(stderr, "[%d] createHashMap failed\n", rank);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        
         MPI_Offset cur = my_off;
+        size_t buf_used = 0;
         
         while (cur < my_end) {
-            // 计算本次读取的大小
+            // 计算本次读取大小
             MPI_Offset remaining = my_end - cur;
-            size_t read_size = (remaining < buf_size) ? remaining : buf_size;
+            size_t read_size = (remaining < buf_size - buf_used) ? 
+                               (size_t)remaining : (buf_size - buf_used);
             
             if (read_size == 0) break;
             
-            // 读取一块数据
-            MPI_File_read_at(fh, cur, buf, read_size, MPI_CHAR, MPI_STATUS_IGNORE);
+            // 读取数据到缓冲区
+            MPI_File_read_at(fh, cur, buf + buf_used, read_size, MPI_CHAR, MPI_STATUS_IGNORE);
+            buf_used += read_size;
+            cur += read_size;
             
-            // 处理缓冲区中的数据
+            // 处理完整行
             char *start = buf;
-            char *end = buf + read_size;
+            char *end = buf + buf_used;
             
             while (start < end) {
-                // 查找行结束符
                 char *line_end = (char*)memchr(start, '\n', end - start);
                 
                 if (line_end) {
-                    // 计算行长度
                     size_t line_len = line_end - start;
                     
-                    // 确保行长度正确
-                    if (line_len == (size_t)key_len) {
-                        // 复制键值并添加到哈希表
-                        char key[MAX_KEYLEN + 1];
-                        memcpy(key, start, key_len);
-                        key[key_len] = '\0';
-                        mapAdd(map, key, 1, key_len);
+                    // 确保行长度在有效范围内
+                    if (line_len > 0 && line_len <= MAX_KEYLEN) {
+                        // 添加到哈希表
+                        mapAdd(map, start, 1, key_len);
                     }
                     
                     // 移动到下一行
                     start = line_end + 1;
-                    cur += line_len + 1;
                 } else {
-                    // 没有找到完整的行，移动剩余数据到缓冲区开头
+                    // 移动剩余数据到缓冲区开头
                     size_t remaining = end - start;
-                    if (remaining > 0) {
+                    if (remaining > 0 && remaining < buf_size) {
                         memmove(buf, start, remaining);
+                        buf_used = remaining;
+                    } else {
+                        buf_used = 0;
                     }
                     break;
                 }
             }
-            
-            // 如果缓冲区有剩余数据，调整起始位置
-            if (start < end) {
-                size_t remaining = end - start;
-                memmove(buf, start, remaining);
-                start = buf + remaining;
-            } else {
-                start = buf;
-            }
         }
         
-        // 关闭MPI文件
+        // 关闭文件并释放缓冲区
         MPI_File_close(&fh);
         free(buf);
 
-        // 汇总 map entry counts 到 rank 0
-        size_t local_n = 0;
-        for (size_t i = 0; i < map->cap; i++)
-            for (Node* p = map->buckets[i]; p; p = p->next)
-                local_n++;
-
-        Entry *loc_arr = (Entry*)malloc(local_n * sizeof(Entry));
-        if (!loc_arr) {
-            fprintf(stderr, "[%d] malloc failed\n", rank);
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-        size_t idx = 0;
-        for (size_t i = 0; i < map->cap; i++)
-            for (Node* p = map->buckets[i]; p; p = p->next) {
-                memcpy(loc_arr[idx].key, p->key, key_len + 1);
-                loc_arr[idx].count = p->count;
-                idx++;
+        // 准备发送本地数据
+        size_t local_n = map->size;
+        Entry *loc_arr = NULL;
+        
+        if (local_n > 0) {
+            loc_arr = (Entry*)malloc(local_n * sizeof(Entry));
+            if (!loc_arr) {
+                fprintf(stderr, "[%d] malloc failed\n", rank);
+                MPI_Abort(MPI_COMM_WORLD, 1);
             }
-
+            
+            // 复制哈希表数据到数组
+            size_t idx = 0;
+            for (size_t i = 0; i < map->cap; i++) {
+                for (Node* p = map->buckets[i]; p; p = p->next) {
+                    if (idx < local_n) {
+                        memcpy(loc_arr[idx].key, p->key, MAX_KEYLEN + 1);
+                        loc_arr[idx].count = p->count;
+                        idx++;
+                    }
+                }
+            }
+        }
+        
+        // 释放本地哈希表
+        freeHashMap(map);
+        
+        // 创建MPI数据类型
+        MPI_Datatype entry_type;
+        MPI_Type_contiguous(sizeof(Entry), MPI_BYTE, &entry_type);
+        MPI_Type_commit(&entry_type);
+        
+        // 收集各进程数据量
+        int local_int = (int)local_n;
         int *counts = NULL;
         int *displs = NULL;
-        Entry *all = NULL;
         int total = 0;
-
-        int local_int = (int)local_n;
-
+        
         if (rank == 0) {
             counts = (int*)malloc(nprocs * sizeof(int));
             displs = (int*)malloc(nprocs * sizeof(int));
@@ -283,80 +335,109 @@ int main(int argc, char *argv[]) {
                 MPI_Abort(MPI_COMM_WORLD, 1);
             }
         }
-
+        
         MPI_Gather(&local_int, 1, MPI_INT, counts, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
+        
         if (rank == 0) {
             displs[0] = 0;
-            for (int i = 1; i < nprocs; i++)
+            for (int i = 1; i < nprocs; i++) {
                 displs[i] = displs[i-1] + counts[i-1];
+            }
             total = displs[nprocs-1] + counts[nprocs-1];
+        }
+        
+        // 广播总数据量
+        MPI_Bcast(&total, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        
+        // 分配接收缓冲区
+        Entry *all = NULL;
+        if (rank == 0 && total > 0) {
             all = (Entry*)malloc(total * sizeof(Entry));
             if (!all) {
                 fprintf(stderr, "[0] malloc failed\n");
                 MPI_Abort(MPI_COMM_WORLD, 1);
             }
         }
-
-        MPI_Datatype entry_type;
-        MPI_Type_contiguous(sizeof(Entry), MPI_BYTE, &entry_type);
-        MPI_Type_commit(&entry_type);
-
-        MPI_Gatherv(loc_arr, local_int, entry_type,
-                    all, counts, displs, entry_type,
-                    0, MPI_COMM_WORLD);
-
+        
+        // 一次性收集所有数据（不再分批）
+        if (loc_arr) {
+            MPI_Gatherv(
+                loc_arr, 
+                local_int, 
+                entry_type,
+                (rank == 0) ? all : NULL, 
+                (rank == 0) ? counts : NULL, 
+                (rank == 0) ? displs : NULL, 
+                entry_type,
+                0, 
+                MPI_COMM_WORLD
+            );
+        } else {
+            MPI_Gatherv(
+                NULL, 
+                0, 
+                entry_type,
+                (rank == 0) ? all : NULL, 
+                (rank == 0) ? counts : NULL, 
+                (rank == 0) ? displs : NULL, 
+                entry_type,
+                0, 
+                MPI_COMM_WORLD
+            );
+        }
+        
+        // 释放数据类型和本地数组
         MPI_Type_free(&entry_type);
-
-        if (rank == 0) {
-            // 归并计数
-            HashMap *agg = createHashMap(200003);
-            for (size_t i = 0; i < total; i++) {
-                mapAdd(agg, all[i].key, all[i].count, key_len);
-            }
-
-            size_t m = 0;
-            for (size_t i = 0; i < agg->cap; i++)
-                for (Node* p = agg->buckets[i]; p; p = p->next)
-                    m++;
-
-            Entry *agg_arr = (Entry*)malloc(m * sizeof(Entry));
-            size_t id2 = 0;
-            for (size_t i = 0; i < agg->cap; i++)
-                for (Node* p = agg->buckets[i]; p; p = p->next) {
-                    memcpy(agg_arr[id2].key, p->key, key_len + 1);
-                    agg_arr[id2].count = p->count;
-                    id2++;
+        if (loc_arr) free(loc_arr);
+        
+        // Rank 0处理汇总结果
+        if (rank == 0 && total > 0) {
+            // 按key排序以便归并
+            qsort(all, total, sizeof(Entry), cmpKey);
+            
+            // 合并相同项
+            size_t j = 0;
+            for (size_t i = 1; i < total; i++) {
+                if (strcmp(all[i].key, all[j].key) == 0) {
+                    all[j].count += all[i].count;
+                } else {
+                    j++;
+                    all[j] = all[i];
                 }
-            quickSortForEntry(agg_arr, 0, m - 1);
-
+            }
+            size_t unique_count = j + 1;
+            
+            // 按频率排序
+            quickSortForEntry(all, 0, unique_count - 1);
+            
             // 写入输出文件
             char outpath[PATH_MAX];
-            snprintf(outpath, sizeof(outpath), "output/result%d_%s_mpi.txt", key_len, scale);
+            snprintf(outpath, sizeof(outpath), "output/result%d_%s.txt", key_len, scale);
             FILE *fo = fopen(outpath, "w");
             if (!fo) {
                 perror("fopen output");
                 MPI_Abort(MPI_COMM_WORLD, 1);
-            }
-            fprintf(fo, "%zu\n", m);
-            for (size_t i = 0; i < m; i++) {
-                fprintf(fo, "%.*s %d\n", key_len, agg_arr[i].key, agg_arr[i].count);
+            } 
+            
+            fprintf(fo, "%zu\n", unique_count);
+            for (size_t i = 0; i < unique_count; i++) {
+                fprintf(fo, "%.*s %d\n", key_len, all[i].key, all[i].count);
             }
             fclose(fo);
-
+            
             double elapsed = MPI_Wtime() - t0;
-            printf("  ✅ Done %s in %.3f seconds, unique keys = %zu\n", ent->d_name, elapsed, m);
-
+            printf("  ✅ Done %s in %.3f seconds, unique keys = %zu\n", ent->d_name, elapsed, unique_count);
+            
             // 清理内存
-            free(agg_arr);
-            freeHashMap(agg);
             free(all);
             free(counts);
             free(displs);
+        } else if (rank == 0) {
+            // 处理没有数据的情况
+            if (counts) free(counts);
+            if (displs) free(displs);
         }
-
-        free(loc_arr);
-        freeHashMap(map);
+        
         MPI_Barrier(MPI_COMM_WORLD);
     }
 
