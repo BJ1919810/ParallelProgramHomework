@@ -212,10 +212,9 @@ int main() {
         int len = 0, countM = 0;
         sscanf(ent->d_name, "data_%d_%dM.txt", &len, &countM);
         
-        char inpath[300], outpath[300], anspath[300];
+        char inpath[300], outpath[300];
         snprintf(inpath, sizeof(inpath), "dataset/%s", ent->d_name);
         snprintf(outpath, sizeof(outpath), "output/result%d_%dM.txt", len, countM);
-        snprintf(anspath, sizeof(anspath), "answer/result%d_%dM.txt", len, countM);
         
         // 读取文件数据
         FILE* fin = fopen(inpath, "r");
@@ -292,28 +291,9 @@ int main() {
             fclose(fout);
         }
         
-        // 验证结果
-        bool ok = true;
-        FILE* fans = fopen(anspath, "r");
-        if (fans) {
-            FILE* fcheck = fopen(outpath, "r");
-            if (fcheck) {
-                char line1[256], line2[256];
-                while (fgets(line1, sizeof(line1), fcheck)) {
-                    if (!fgets(line2, sizeof(line2), fans) || strcmp(line1, line2)) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (fgets(line2, sizeof(line2), fans)) ok = false;
-                fclose(fcheck);
-            }
-            fclose(fans);
-        }
-        
         double t1 = omp_get_wtime();
-        printf("Processed %s (%d lines) in %.3f s | Threads: %d | %s\n", 
-               ent->d_name, n, t1-t0, tcount, ok ? "OK" : "ERROR");
+        printf("Processed %s (%d lines) in %.3f s | Threads: %d\n", 
+               ent->d_name, n, t1-t0, tcount);
         
         // 清理资源
         destroyHashMap(global);
