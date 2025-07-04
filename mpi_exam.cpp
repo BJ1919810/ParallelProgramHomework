@@ -9,6 +9,7 @@
 #define MAX_KEYLEN 64
 #define INIT_HASH_CAP 100003   // 初始哈希表容量
 #define MAX_LOAD_FACTOR 0.75   // 哈希表最大负载因子
+int g_key_len = 0;
 
 struct Entry {
     char key[MAX_KEYLEN + 1];
@@ -89,8 +90,8 @@ void mapAdd(HashMap* m, const char* key, int cnt, int key_len) {
     // 创建新节点
     Node* n = (Node*)malloc(sizeof(Node));
     if (!n) return;
+    memset(n->key, 0, MAX_KEYLEN + 1);
     memcpy(n->key, key, key_len);
-    n->key[key_len] = '\0';
     n->count = cnt;
     n->next = m->buckets[h];
     m->buckets[h] = n;
@@ -119,13 +120,13 @@ void swapEntry(Entry &a, Entry &b) {
 
 int cmpEntry(const Entry &a, const Entry &b) {
     if (a.count != b.count) return (b.count - a.count);
-    return strcmp(a.key, b.key);
+    return memcmp(a.key, b.key, g_key_len);
 }
 
 int cmpKey(const void* a, const void* b) {
     const Entry* ea = (const Entry*)a;
     const Entry* eb = (const Entry*)b;
-    return strcmp(ea->key, eb->key);
+    return memcmp(ea->key, eb->key, g_key_len);
 }
 
 void quickSortForEntry(Entry *arr, int left, int right) {
@@ -168,6 +169,7 @@ int main(int argc, char *argv[]) {
         int key_len;
         char scale[16];
         if (!parseDatasetName(ent->d_name, key_len, scale)) continue;
+        g_key_len = key_len;
 
         char *dot = strrchr(scale, '.');
         if (dot && strcmp(dot, ".txt") == 0) {
@@ -202,23 +204,22 @@ int main(int argc, char *argv[]) {
         MPI_Offset my_off = rank * chunk;
         MPI_Offset my_end = (rank == nprocs - 1) ? file_size : (my_off + chunk);
 
+        const size_t probe_size = 4096;  // 4KB探测块
+
         // 边界处理：确保从行首开始
         if (rank > 0 && my_off > 0) {
-            const size_t probe_size = 4096;  // 4KB探测块
             char* probe_buf = (char*)malloc(probe_size);
-            if (!probe_buf) {
-                fprintf(stderr, "[%d] malloc failed\n", rank);
-                MPI_Abort(MPI_COMM_WORLD, 1);
-            }
-            
-            // 读取探测块查找换行符
             MPI_File_read_at(fh, my_off, probe_buf, probe_size, MPI_CHAR, MPI_STATUS_IGNORE);
             char* nl_pos = (char*)memchr(probe_buf, '\n', probe_size);
-            
-            if (nl_pos) {
-                my_off += (nl_pos - probe_buf) + 1;  // 移动到行首
-            }
-            
+            if (nl_pos) my_off += (nl_pos - probe_buf) + 1;
+            free(probe_buf);
+        }
+
+        if (rank < nprocs-1) {
+            char* probe_buf = (char*)malloc(probe_size);
+            MPI_File_read_at(fh, my_end, probe_buf, probe_size, MPI_CHAR, MPI_STATUS_IGNORE);
+            char* nl_pos = (char*)memchr(probe_buf, '\n', probe_size);
+            if (nl_pos) my_end += (nl_pos - probe_buf) + 1;
             free(probe_buf);
         }
 
@@ -240,7 +241,7 @@ int main(int argc, char *argv[]) {
         MPI_Offset cur = my_off;
         size_t buf_used = 0;
         
-        while (cur < my_end) {
+        while (cur < my_end || buf_used > 0) {
             // 计算本次读取大小
             MPI_Offset remaining = my_end - cur;
             size_t read_size = (remaining < buf_size - buf_used) ? 
@@ -264,7 +265,7 @@ int main(int argc, char *argv[]) {
                     size_t line_len = line_end - start;
                     
                     // 确保行长度在有效范围内
-                    if (line_len > 0 && line_len <= MAX_KEYLEN) {
+                    if ((size_t)line_len == (size_t)key_len) {
                         // 添加到哈希表
                         mapAdd(map, start, 1, key_len);
                     }
@@ -398,7 +399,7 @@ int main(int argc, char *argv[]) {
             // 合并相同项
             size_t j = 0;
             for (size_t i = 1; i < total; i++) {
-                if (strcmp(all[i].key, all[j].key) == 0) {
+                if (memcmp(all[i].key, all[j].key, key_len) == 0) {
                     all[j].count += all[i].count;
                 } else {
                     j++;
@@ -406,6 +407,7 @@ int main(int argc, char *argv[]) {
                 }
             }
             size_t unique_count = j + 1;
+
             
             // 按频率排序
             quickSortForEntry(all, 0, unique_count - 1);
